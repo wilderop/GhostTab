@@ -1,0 +1,22 @@
+# GhostTab Configuration
+
+# How long (in hours) offline players should remain visible in the tab list
+offline-window-hours: 24
+
+# How often (in seconds) the tab list times should refresh
+update-interval-seconds: 30
+
+# Tab list header (supports MiniMessage / Adventure formatting)
+header: "<gold><bold>A Zombie Pigman Broke My Door</bold></gold>"
+
+# Tab list footer
+footer: "<gray>Online: {online} | Ghosts: {ghosts}</gray>"
+
+# Display format for online players: {name} and {time}
+online-format: "<white>{name} <gray>{time}</gray>"
+
+# Display format for offline/ghost players: {name} and {time}
+offline-format: "<dark_gray>{name} <gray>offline {time}</gray>"
+
+# Sort offline players by most recently offline first (true) or alphabetically (false)
+sort-offline-by-recent: true

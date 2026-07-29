@@ -1,0 +1,9 @@
+{
+  "id": "ghosttab",
+  "name": "GhostTab",
+  "version": "1.0",
+  "description": "Shows online players with session time and recently offline players in the tab list",
+  "authors": ["wilderop"],
+  "dependencies": [],
+  "main": "com.wilderop.ghost.GhostTabPlugin"
+}
