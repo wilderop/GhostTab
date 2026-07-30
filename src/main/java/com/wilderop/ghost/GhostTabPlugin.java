@@ -33,7 +33,7 @@ import java.util.stream.Collectors;
 @Plugin(
         id = "ghosttab",
         name = "GhostTab",
-        version = "1.1",
+        version = "1.2",
         description = "Shows online players with session time and recently offline players in the tab list",
         authors = {"wilderop"}
 )
@@ -72,7 +72,13 @@ public class GhostTabPlugin {
                 .repeat(updateIntervalSeconds, TimeUnit.SECONDS)
                 .schedule();
 
-        logger.info("GhostTab v1.1 enabled. Offline window: {} hours, update every {}s",
+        // Periodic save so a hard kill / crash loses less data
+        server.getScheduler()
+                .buildTask(this, this::saveData)
+                .repeat(5, TimeUnit.MINUTES)
+                .schedule();
+
+        logger.info("GhostTab v1.2 enabled. Offline window: {} hours, update every {}s",
                 TimeUnit.MILLISECONDS.toHours(offlineWindowMillis), updateIntervalSeconds);
     }
 
@@ -306,13 +312,24 @@ public class GhostTabPlugin {
 
     private void loadData() {
         Path dataFile = dataDirectory.resolve("playerdata.yml");
-        if (!Files.exists(dataFile)) return;
+        if (!Files.exists(dataFile)) {
+            logger.info("No existing playerdata.yml found");
+            return;
+        }
 
         try {
             Yaml yaml = new Yaml();
             try (InputStream in = Files.newInputStream(dataFile)) {
                 Map<String, Object> raw = yaml.load(in);
-                if (raw == null) return;
+                if (raw == null) {
+                    logger.info("playerdata.yml was empty");
+                    return;
+                }
+
+                Instant now = Instant.now();
+                Instant cutoff = now.minusMillis(offlineWindowMillis);
+                int loaded = 0;
+                int skipped = 0;
 
                 for (Map.Entry<String, Object> entry : raw.entrySet()) {
                     try {
@@ -320,17 +337,33 @@ public class GhostTabPlugin {
                         @SuppressWarnings("unchecked")
                         Map<String, Object> map = (Map<String, Object>) entry.getValue();
                         String name = String.valueOf(map.getOrDefault("name", "Unknown"));
-                        long lastSeenEpoch = ((Number) map.getOrDefault("lastSeen", Instant.now().getEpochSecond())).longValue();
+                        Object lastSeenObj = map.get("lastSeen");
+                        if (lastSeenObj == null) {
+                            skipped++;
+                            continue;
+                        }
+                        long lastSeenEpoch = ((Number) lastSeenObj).longValue();
+                        Instant lastSeen = Instant.ofEpochSecond(lastSeenEpoch);
+
+                        // Skip anyone already outside the offline window
+                        if (lastSeen.isBefore(cutoff)) {
+                            skipped++;
+                            continue;
+                        }
+
                         PlayerData data = new PlayerData(name);
                         data.uuid = uuid;
-                        data.lastSeen = Instant.ofEpochSecond(lastSeenEpoch);
+                        data.lastSeen = lastSeen;
                         data.online = false;
                         playerData.put(uuid, data);
-                    } catch (Exception ignored) {
+                        loaded++;
+                    } catch (Exception e) {
+                        logger.warn("Skipping bad playerdata entry {}: {}", entry.getKey(), e.getMessage());
+                        skipped++;
                     }
                 }
+                logger.info("Loaded {} player records ({} skipped as too old/invalid)", loaded, skipped);
             }
-            logger.info("Loaded {} player records", playerData.size());
         } catch (Exception e) {
             logger.warn("Could not load player data", e);
         }
@@ -342,15 +375,22 @@ public class GhostTabPlugin {
                 Files.createDirectories(dataDirectory);
             }
 
+            Instant now = Instant.now();
+            Instant cutoff = now.minusMillis(offlineWindowMillis);
             Map<String, Object> toSave = new LinkedHashMap<>();
-            Instant cutoff = Instant.now().minusMillis(offlineWindowMillis);
 
             for (Map.Entry<UUID, PlayerData> entry : playerData.entrySet()) {
                 PlayerData data = entry.getValue();
-                if (data.online || data.lastSeen.isAfter(cutoff)) {
+
+                // Players who are still online at shutdown must be treated as
+                // having just gone offline *now*, otherwise their lastSeen stays
+                // at login time and they appear offline for hours after reboot.
+                Instant effectiveLastSeen = data.online ? now : data.lastSeen;
+
+                if (data.online || effectiveLastSeen.isAfter(cutoff)) {
                     Map<String, Object> map = new LinkedHashMap<>();
                     map.put("name", data.name);
-                    map.put("lastSeen", data.lastSeen.getEpochSecond());
+                    map.put("lastSeen", effectiveLastSeen.getEpochSecond());
                     toSave.put(entry.getKey().toString(), map);
                 }
             }
@@ -358,6 +398,7 @@ public class GhostTabPlugin {
             Path dataFile = dataDirectory.resolve("playerdata.yml");
             Yaml yaml = new Yaml();
             Files.writeString(dataFile, yaml.dump(toSave));
+            logger.info("Saved {} player records to disk", toSave.size());
         } catch (IOException e) {
             logger.error("Failed to save player data", e);
         }
