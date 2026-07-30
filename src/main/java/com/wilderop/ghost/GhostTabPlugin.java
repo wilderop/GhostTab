@@ -33,7 +33,7 @@ import java.util.stream.Collectors;
 @Plugin(
         id = "ghosttab",
         name = "GhostTab",
-        version = "1.2",
+        version = "1.3",
         description = "Shows online players with session time and recently offline players in the tab list",
         authors = {"wilderop"}
 )
@@ -78,7 +78,7 @@ public class GhostTabPlugin {
                 .repeat(5, TimeUnit.MINUTES)
                 .schedule();
 
-        logger.info("GhostTab v1.2 enabled. Offline window: {} hours, update every {}s",
+        logger.info("GhostTab v1.3 enabled. Offline window: {} hours, update every {}s",
                 TimeUnit.MILLISECONDS.toHours(offlineWindowMillis), updateIntervalSeconds);
     }
 
@@ -167,78 +167,93 @@ public class GhostTabPlugin {
                                   Component header, Component footer, Instant now) {
         TabList tabList = viewer.getTabList();
 
-        // Clear everything and rebuild so order is consistent
-        Set<UUID> currentEntries = tabList.getEntries().stream()
-                .map(e -> e.getProfile().getId())
+        // UUIDs of players currently online on the proxy.
+        // NEVER remove or recreate these — Velocity/backend own them.
+        // Clearing + re-adding with modified profiles causes malformed packets
+        // and kicks (especially with ViaVersion).
+        Set<UUID> onlineUuids = server.getAllPlayers().stream()
+                .map(Player::getUniqueId)
                 .collect(Collectors.toSet());
-        for (UUID uuid : currentEntries) {
-            tabList.removeEntry(uuid);
+
+        // Desired ghost UUIDs this tick
+        Set<UUID> desiredGhosts = offline.stream()
+                .map(d -> d.uuid)
+                .filter(uuid -> uuid != null && !onlineUuids.contains(uuid))
+                .collect(Collectors.toSet());
+
+        // Remove only stale ghost entries (not online players)
+        for (TabListEntry existing : new ArrayList<>(tabList.getEntries())) {
+            UUID id = existing.getProfile().getId();
+            if (!onlineUuids.contains(id) && !desiredGhosts.contains(id)) {
+                tabList.removeEntry(id);
+            }
         }
 
-        // listOrder: higher number = higher in the list (Minecraft 1.21.2+)
-        // Online players get 10000+, offline get lower values so they stay at the bottom.
-        // Within each group we decrease the number so alphabetical order is preserved.
-        int listOrder = 10000 + online.size();
-
-        // --- Online players (top) ---
+        // --- Online players: only update display name / listOrder in place ---
+        int onlineOrder = 10000 + online.size();
         for (PlayerData data : online) {
-            listOrder--;
+            onlineOrder--;
+            if (data.uuid == null) continue;
 
-            Optional<Player> realPlayer = server.getPlayer(data.uuid);
-            GameProfile profile;
-            int latency = 0;
-
-            if (realPlayer.isPresent()) {
-                Player p = realPlayer.get();
-                // Keep real skin, but use a sort-friendly name for older clients
-                // Prefix "0" sorts before "1", so online appear above offline
-                profile = new GameProfile(data.uuid, "0" + data.name, p.getGameProfile().getProperties());
-                latency = (int) p.getPing();
-            } else {
-                profile = new GameProfile(data.uuid, "0" + data.name, List.of());
+            Optional<TabListEntry> existingOpt = tabList.getEntry(data.uuid);
+            if (existingOpt.isEmpty()) {
+                // Not present yet (very early join) — leave it to Velocity
+                continue;
             }
 
+            TabListEntry existing = existingOpt.get();
             Instant since = data.onlineSince != null ? data.onlineSince : now;
             String timeStr = formatDuration(Duration.between(since, now));
             String display = onlineFormat
                     .replace("{name}", data.name)
                     .replace("{time}", timeStr);
 
-            TabListEntry entry = TabListEntry.builder()
-                    .tabList(tabList)
-                    .profile(profile)
-                    .displayName(parse(display))
-                    .latency(latency)
-                    .gameMode(0)
-                    .listOrder(listOrder)
-                    .build();
-
-            tabList.addEntry(entry);
+            existing.setDisplayName(parse(display));
+            try {
+                existing.setListOrder(onlineOrder);
+            } catch (Throwable ignored) {
+                // listOrder only on 1.21.2+
+            }
         }
 
-        // --- Offline / ghost players (bottom) ---
-        listOrder = 1000 + offline.size(); // much lower than online
+        // --- Ghost / offline players: add or update ---
+        int ghostOrder = 1000 + offline.size();
         for (PlayerData data : offline) {
-            listOrder--;
-
-            // Prefix "1" so older clients sort these after the "0..." online entries
-            GameProfile profile = new GameProfile(data.uuid, "1" + data.name, List.of());
+            ghostOrder--;
+            if (data.uuid == null || onlineUuids.contains(data.uuid)) continue;
 
             String timeStr = formatDuration(Duration.between(data.lastSeen, now));
             String display = offlineFormat
                     .replace("{name}", data.name)
                     .replace("{time}", timeStr);
+            Component displayComponent = parse(display);
 
-            TabListEntry entry = TabListEntry.builder()
-                    .tabList(tabList)
-                    .profile(profile)
-                    .displayName(parse(display))
-                    .latency(0)
-                    .gameMode(0)
-                    .listOrder(listOrder)
-                    .build();
+            Optional<TabListEntry> existingOpt = tabList.getEntry(data.uuid);
+            if (existingOpt.isPresent()) {
+                TabListEntry existing = existingOpt.get();
+                existing.setDisplayName(displayComponent);
+                try {
+                    existing.setListOrder(ghostOrder);
+                } catch (Throwable ignored) {
+                }
+            } else {
+                // Real name, empty properties (default skin). No name prefix hacks.
+                GameProfile profile = new GameProfile(data.uuid, data.name, List.of());
 
-            tabList.addEntry(entry);
+                TabListEntry.Builder builder = TabListEntry.builder()
+                        .tabList(tabList)
+                        .profile(profile)
+                        .displayName(displayComponent)
+                        .latency(0)
+                        .gameMode(0);
+
+                try {
+                    builder.listOrder(ghostOrder);
+                } catch (Throwable ignored) {
+                }
+
+                tabList.addEntry(builder.build());
+            }
         }
 
         viewer.sendPlayerListHeaderAndFooter(header, footer);
