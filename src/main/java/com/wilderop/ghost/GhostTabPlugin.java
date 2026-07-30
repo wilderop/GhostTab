@@ -33,7 +33,7 @@ import java.util.stream.Collectors;
 @Plugin(
         id = "ghosttab",
         name = "GhostTab",
-        version = "1.0",
+        version = "1.1",
         description = "Shows online players with session time and recently offline players in the tab list",
         authors = {"wilderop"}
 )
@@ -53,7 +53,6 @@ public class GhostTabPlugin {
     private String footerTemplate = "<gray>Online: {online} | Ghosts: {ghosts}</gray>";
     private String onlineFormat = "<white>{name} <gray>{time}</gray>";
     private String offlineFormat = "<dark_gray>{name} <gray>offline {time}</gray>";
-    private boolean sortOfflineByRecent = true;
 
     @Inject
     public GhostTabPlugin(ProxyServer server, Logger logger, @DataDirectory Path dataDirectory) {
@@ -73,7 +72,7 @@ public class GhostTabPlugin {
                 .repeat(updateIntervalSeconds, TimeUnit.SECONDS)
                 .schedule();
 
-        logger.info("GhostTab v1.0 enabled. Offline window: {} hours, update every {}s",
+        logger.info("GhostTab v1.1 enabled. Offline window: {} hours, update every {}s",
                 TimeUnit.MILLISECONDS.toHours(offlineWindowMillis), updateIntervalSeconds);
     }
 
@@ -134,15 +133,10 @@ public class GhostTabPlugin {
             }
         }
 
-        // Sort online alphabetically by name
-        online.sort(Comparator.comparing(d -> d.name.toLowerCase(Locale.ROOT)));
-
-        // Sort offline
-        if (sortOfflineByRecent) {
-            offline.sort(Comparator.comparing((PlayerData d) -> d.lastSeen).reversed());
-        } else {
-            offline.sort(Comparator.comparing(d -> d.name.toLowerCase(Locale.ROOT)));
-        }
+        // Both lists sorted alphabetically (case-insensitive)
+        Comparator<PlayerData> alpha = Comparator.comparing(d -> d.name.toLowerCase(Locale.ROOT));
+        online.sort(alpha);
+        offline.sort(alpha);
 
         int onlineCount = online.size();
         int ghostCount = offline.size();
@@ -167,35 +161,39 @@ public class GhostTabPlugin {
                                   Component header, Component footer, Instant now) {
         TabList tabList = viewer.getTabList();
 
-        // Clear existing entries that we manage (everything except the viewer themselves is safer to rebuild)
-        // We remove all and re-add to keep it simple and consistent
+        // Clear everything and rebuild so order is consistent
         Set<UUID> currentEntries = tabList.getEntries().stream()
                 .map(e -> e.getProfile().getId())
                 .collect(Collectors.toSet());
-
-        // Keep the viewer's own entry if present, but we'll rebuild everything for consistency
         for (UUID uuid : currentEntries) {
             tabList.removeEntry(uuid);
         }
 
-        // Add online players
+        // listOrder: higher number = higher in the list (Minecraft 1.21.2+)
+        // Online players get 10000+, offline get lower values so they stay at the bottom.
+        // Within each group we decrease the number so alphabetical order is preserved.
+        int listOrder = 10000 + online.size();
+
+        // --- Online players (top) ---
         for (PlayerData data : online) {
+            listOrder--;
+
             Optional<Player> realPlayer = server.getPlayer(data.uuid);
             GameProfile profile;
             int latency = 0;
-            int gameMode = 0;
 
             if (realPlayer.isPresent()) {
                 Player p = realPlayer.get();
-                profile = p.getGameProfile();
+                // Keep real skin, but use a sort-friendly name for older clients
+                // Prefix "0" sorts before "1", so online appear above offline
+                profile = new GameProfile(data.uuid, "0" + data.name, p.getGameProfile().getProperties());
                 latency = (int) p.getPing();
-                // gameMode is not directly available on proxy easily; leave 0 (survival)
             } else {
-                // Shouldn't happen for online, but fallback
-                profile = new GameProfile(data.uuid, data.name, List.of());
+                profile = new GameProfile(data.uuid, "0" + data.name, List.of());
             }
 
-            String timeStr = formatDuration(Duration.between(data.onlineSince, now));
+            Instant since = data.onlineSince != null ? data.onlineSince : now;
+            String timeStr = formatDuration(Duration.between(since, now));
             String display = onlineFormat
                     .replace("{name}", data.name)
                     .replace("{time}", timeStr);
@@ -205,15 +203,20 @@ public class GhostTabPlugin {
                     .profile(profile)
                     .displayName(parse(display))
                     .latency(latency)
-                    .gameMode(gameMode)
+                    .gameMode(0)
+                    .listOrder(listOrder)
                     .build();
 
             tabList.addEntry(entry);
         }
 
-        // Add offline/ghost players
+        // --- Offline / ghost players (bottom) ---
+        listOrder = 1000 + offline.size(); // much lower than online
         for (PlayerData data : offline) {
-            GameProfile profile = new GameProfile(data.uuid, data.name, List.of()); // no skin for ghosts
+            listOrder--;
+
+            // Prefix "1" so older clients sort these after the "0..." online entries
+            GameProfile profile = new GameProfile(data.uuid, "1" + data.name, List.of());
 
             String timeStr = formatDuration(Duration.between(data.lastSeen, now));
             String display = offlineFormat
@@ -226,12 +229,12 @@ public class GhostTabPlugin {
                     .displayName(parse(display))
                     .latency(0)
                     .gameMode(0)
+                    .listOrder(listOrder)
                     .build();
 
             tabList.addEntry(entry);
         }
 
-        // Set header/footer
         viewer.sendPlayerListHeaderAndFooter(header, footer);
     }
 
@@ -294,7 +297,6 @@ public class GhostTabPlugin {
                     footerTemplate = String.valueOf(cfg.getOrDefault("footer", footerTemplate));
                     onlineFormat = String.valueOf(cfg.getOrDefault("online-format", onlineFormat));
                     offlineFormat = String.valueOf(cfg.getOrDefault("offline-format", offlineFormat));
-                    sortOfflineByRecent = Boolean.parseBoolean(String.valueOf(cfg.getOrDefault("sort-offline-by-recent", true)));
                 }
             }
         } catch (Exception e) {
