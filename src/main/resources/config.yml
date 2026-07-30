@@ -17,6 +17,3 @@ online-format: "<white>{name} <gray>{time}</gray>"
 
 # Display format for offline/ghost players: {name} and {time}
 offline-format: "<dark_gray>{name} <gray>offline {time}</gray>"
-
-# Sort offline players by most recently offline first (true) or alphabetically (false)
-sort-offline-by-recent: true

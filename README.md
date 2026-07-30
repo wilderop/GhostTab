@@ -13,7 +13,7 @@ Offline players remain visible for a configurable window (default **24 hours**).
 - Configurable header / footer with placeholders `{online}` and `{ghosts}`
 - Configurable display formats using MiniMessage
 - Persists recent player data across proxy restarts
-- Online players sorted alphabetically, offline players sorted by most recently offline (configurable)
+- Online players at the top (A–Z), offline/ghost players at the bottom (A–Z)
 - No dependency on backend plugins or VelocityTab
 
 ## Requirements
@@ -50,7 +50,6 @@ header: "<gold><bold>A Zombie Pigman Broke My Door</bold></gold>"
 footer: "<gray>Online: {online} | Ghosts: {ghosts}</gray>"
 online-format: "<white>{name} <gray>{time}</gray>"
 offline-format: "<dark_gray>{name} <gray>offline {time}</gray>"
-sort-offline-by-recent: true
 ```
 
 ## Notes
