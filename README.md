@@ -14,7 +14,9 @@ Offline players remain visible for a configurable window (default **24 hours**).
 - Footer can show total hours played by all players in a rolling window (default 12 hours)
 - Configurable display formats using MiniMessage
 - Persists recent player data and playtime sessions across proxy restarts
-- Online players at the top (A–Z), offline/ghost players at the bottom (A–Z)
+- Online players sorted by session length (longest online at the top)
+- Offline/ghost players sorted by offline time (longest offline at the bottom)
+- Caches player skins so ghosts keep their real skin after disconnect/reboot
 - No dependency on backend plugins or VelocityTab
 
 ## Requirements
@@ -56,7 +58,7 @@ offline-format: "<dark_gray>{name} <gray>offline {time}</gray>"
 
 ## Notes
 
-- Ghost players appear with no skin (default Steve/Alex silhouette) because the proxy does not store skin data for offline players.
+- Ghost player skins are cached from when they were last online and restored after disconnect/reboot.
 - The plugin tracks players that connect through the proxy. Players who only ever joined backends directly will not appear.
 - Times are approximate and update on the configured interval.
 
