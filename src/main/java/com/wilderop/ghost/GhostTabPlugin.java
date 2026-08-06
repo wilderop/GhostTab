@@ -33,7 +33,7 @@ import java.util.stream.Collectors;
 @Plugin(
         id = "ghosttab",
         name = "GhostTab",
-        version = "1.3",
+        version = "1.4",
         description = "Shows online players with session time and recently offline players in the tab list",
         authors = {"wilderop"}
 )
@@ -44,13 +44,16 @@ public class GhostTabPlugin {
     private final Path dataDirectory;
 
     private final Map<UUID, PlayerData> playerData = new ConcurrentHashMap<>();
+    // Completed play sessions within the playtime window: [startEpochSeconds, endEpochSeconds]
+    private final List<long[]> recentSessions = Collections.synchronizedList(new ArrayList<>());
     private final MiniMessage miniMessage = MiniMessage.miniMessage();
 
     // Config values
     private long offlineWindowMillis = TimeUnit.HOURS.toMillis(24);
+    private long playtimeWindowMillis = TimeUnit.HOURS.toMillis(12);
     private long updateIntervalSeconds = 30;
     private String headerTemplate = "<gold><bold>A Zombie Pigman Broke My Door</bold></gold>";
-    private String footerTemplate = "<gray>Online: {online} | Ghosts: {ghosts}</gray>";
+    private String footerTemplate = "<gray>Players have played a total of <white>{total_hours}</white> hours in the last {playtime_window} hours</gray>";
     private String onlineFormat = "<white>{name} <gray>{time}</gray>";
     private String offlineFormat = "<dark_gray>{name} <gray>offline {time}</gray>";
 
@@ -65,6 +68,7 @@ public class GhostTabPlugin {
     public void onProxyInitialization(ProxyInitializeEvent event) {
         loadConfig();
         loadData();
+        loadPlaytime();
 
         // Schedule periodic tab list updates
         server.getScheduler()
@@ -78,13 +82,18 @@ public class GhostTabPlugin {
                 .repeat(5, TimeUnit.MINUTES)
                 .schedule();
 
-        logger.info("GhostTab v1.3 enabled. Offline window: {} hours, update every {}s",
-                TimeUnit.MILLISECONDS.toHours(offlineWindowMillis), updateIntervalSeconds);
+        logger.info("GhostTab v1.4 enabled. Offline window: {}h, playtime window: {}h, update every {}s",
+                TimeUnit.MILLISECONDS.toHours(offlineWindowMillis),
+                TimeUnit.MILLISECONDS.toHours(playtimeWindowMillis),
+                updateIntervalSeconds);
     }
 
     @Subscribe
     public void onProxyShutdown(ProxyShutdownEvent event) {
+        // Checkpoint current online sessions before saving
+        checkpointOnlineSessions();
         saveData();
+        savePlaytime();
         logger.info("GhostTab data saved.");
     }
 
@@ -112,13 +121,18 @@ public class GhostTabPlugin {
 
         PlayerData data = playerData.get(uuid);
         if (data != null) {
+            Instant now = Instant.now();
+            if (data.online && data.onlineSince != null) {
+                recordSession(data.onlineSince, now);
+            }
             data.online = false;
-            data.lastSeen = Instant.now();
+            data.lastSeen = now;
             data.onlineSince = null;
         }
 
         // Clean up very old entries occasionally
         cleanOldEntries();
+        cleanOldSessions();
     }
 
     private void updateAllTabLists() {
@@ -146,13 +160,19 @@ public class GhostTabPlugin {
 
         int onlineCount = online.size();
         int ghostCount = offline.size();
+        String totalHours = formatTotalHours(computePlaytimeSeconds(now));
+        String playtimeWindowHours = String.valueOf(TimeUnit.MILLISECONDS.toHours(playtimeWindowMillis));
 
         Component header = parse(headerTemplate
                 .replace("{online}", String.valueOf(onlineCount))
-                .replace("{ghosts}", String.valueOf(ghostCount)));
+                .replace("{ghosts}", String.valueOf(ghostCount))
+                .replace("{total_hours}", totalHours)
+                .replace("{playtime_window}", playtimeWindowHours));
         Component footer = parse(footerTemplate
                 .replace("{online}", String.valueOf(onlineCount))
-                .replace("{ghosts}", String.valueOf(ghostCount)));
+                .replace("{ghosts}", String.valueOf(ghostCount))
+                .replace("{total_hours}", totalHours)
+                .replace("{playtime_window}", playtimeWindowHours));
 
         for (Player viewer : server.getAllPlayers()) {
             try {
@@ -313,6 +333,8 @@ public class GhostTabPlugin {
                 if (cfg != null) {
                     offlineWindowMillis = TimeUnit.HOURS.toMillis(
                             ((Number) cfg.getOrDefault("offline-window-hours", 24)).longValue());
+                    playtimeWindowMillis = TimeUnit.HOURS.toMillis(
+                            ((Number) cfg.getOrDefault("playtime-window-hours", 12)).longValue());
                     updateIntervalSeconds = ((Number) cfg.getOrDefault("update-interval-seconds", 30)).longValue();
                     headerTemplate = String.valueOf(cfg.getOrDefault("header", headerTemplate));
                     footerTemplate = String.valueOf(cfg.getOrDefault("footer", footerTemplate));
@@ -414,8 +436,144 @@ public class GhostTabPlugin {
             Yaml yaml = new Yaml();
             Files.writeString(dataFile, yaml.dump(toSave));
             logger.info("Saved {} player records to disk", toSave.size());
+
+            // Also checkpoint playtime on periodic saves
+            checkpointOnlineSessions();
+            savePlaytime();
         } catch (IOException e) {
             logger.error("Failed to save player data", e);
+        }
+    }
+
+    /** Record a completed play session [start, end). */
+    private void recordSession(Instant start, Instant end) {
+        if (start == null || end == null || !end.isAfter(start)) {
+            return;
+        }
+        long startSec = start.getEpochSecond();
+        long endSec = end.getEpochSecond();
+        if (endSec <= startSec) {
+            return;
+        }
+        recentSessions.add(new long[]{startSec, endSec});
+        cleanOldSessions();
+    }
+
+    /** Flush currently-online sessions into the session list and restart their counters. */
+    private void checkpointOnlineSessions() {
+        Instant now = Instant.now();
+        for (PlayerData data : playerData.values()) {
+            if (data.online && data.onlineSince != null) {
+                recordSession(data.onlineSince, now);
+                data.onlineSince = now; // avoid double-counting
+            }
+        }
+    }
+
+    private void cleanOldSessions() {
+        long cutoff = Instant.now().getEpochSecond() - (playtimeWindowMillis / 1000);
+        synchronized (recentSessions) {
+            recentSessions.removeIf(seg -> seg[1] <= cutoff);
+        }
+    }
+
+    /**
+     * Total seconds of playtime that fall inside [now - playtimeWindow, now].
+     * Includes completed sessions (clipped to the window) and current online sessions.
+     */
+    private long computePlaytimeSeconds(Instant now) {
+        long nowSec = now.getEpochSecond();
+        long windowStart = nowSec - (playtimeWindowMillis / 1000);
+        if (windowStart < 0) windowStart = 0;
+
+        long total = 0;
+        synchronized (recentSessions) {
+            for (long[] seg : recentSessions) {
+                long start = Math.max(seg[0], windowStart);
+                long end = Math.min(seg[1], nowSec);
+                if (end > start) {
+                    total += (end - start);
+                }
+            }
+        }
+
+        // Add live online sessions (not yet recorded)
+        for (PlayerData data : playerData.values()) {
+            if (data.online && data.onlineSince != null) {
+                long start = Math.max(data.onlineSince.getEpochSecond(), windowStart);
+                if (nowSec > start) {
+                    total += (nowSec - start);
+                }
+            }
+        }
+        return total;
+    }
+
+    private String formatTotalHours(long totalSeconds) {
+        double hours = totalSeconds / 3600.0;
+        if (hours < 0.05) {
+            return "0";
+        }
+        // One decimal place, strip trailing .0
+        String s = String.format(Locale.US, "%.1f", hours);
+        if (s.endsWith(".0")) {
+            s = s.substring(0, s.length() - 2);
+        }
+        return s;
+    }
+
+    private void loadPlaytime() {
+        Path file = dataDirectory.resolve("playtime.yml");
+        if (!Files.exists(file)) {
+            return;
+        }
+        try {
+            Yaml yaml = new Yaml();
+            try (InputStream in = Files.newInputStream(file)) {
+                Object raw = yaml.load(in);
+                if (!(raw instanceof List<?> list)) {
+                    return;
+                }
+                long cutoff = Instant.now().getEpochSecond() - (playtimeWindowMillis / 1000);
+                int loaded = 0;
+                for (Object item : list) {
+                    if (!(item instanceof Map<?, ?> map)) continue;
+                    Object s = map.get("start");
+                    Object e = map.get("end");
+                    if (!(s instanceof Number) || !(e instanceof Number)) continue;
+                    long start = ((Number) s).longValue();
+                    long end = ((Number) e).longValue();
+                    if (end <= start || end <= cutoff) continue;
+                    recentSessions.add(new long[]{start, end});
+                    loaded++;
+                }
+                logger.info("Loaded {} playtime sessions", loaded);
+            }
+        } catch (Exception e) {
+            logger.warn("Could not load playtime data", e);
+        }
+    }
+
+    private void savePlaytime() {
+        try {
+            if (!Files.exists(dataDirectory)) {
+                Files.createDirectories(dataDirectory);
+            }
+            cleanOldSessions();
+            List<Map<String, Long>> list = new ArrayList<>();
+            synchronized (recentSessions) {
+                for (long[] seg : recentSessions) {
+                    Map<String, Long> m = new LinkedHashMap<>();
+                    m.put("start", seg[0]);
+                    m.put("end", seg[1]);
+                    list.add(m);
+                }
+            }
+            Path file = dataDirectory.resolve("playtime.yml");
+            Yaml yaml = new Yaml();
+            Files.writeString(file, yaml.dump(list));
+        } catch (IOException e) {
+            logger.error("Failed to save playtime data", e);
         }
     }
 
