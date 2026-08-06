@@ -33,7 +33,7 @@ import java.util.stream.Collectors;
 @Plugin(
         id = "ghosttab",
         name = "GhostTab",
-        version = "1.4",
+        version = "1.5",
         description = "Shows online players with session time and recently offline players in the tab list",
         authors = {"wilderop"}
 )
@@ -70,19 +70,17 @@ public class GhostTabPlugin {
         loadData();
         loadPlaytime();
 
-        // Schedule periodic tab list updates
         server.getScheduler()
                 .buildTask(this, this::updateAllTabLists)
                 .repeat(updateIntervalSeconds, TimeUnit.SECONDS)
                 .schedule();
 
-        // Periodic save so a hard kill / crash loses less data
         server.getScheduler()
                 .buildTask(this, this::saveData)
                 .repeat(5, TimeUnit.MINUTES)
                 .schedule();
 
-        logger.info("GhostTab v1.4 enabled. Offline window: {}h, playtime window: {}h, update every {}s",
+        logger.info("GhostTab v1.5 enabled. Offline window: {}h, playtime window: {}h, update every {}s",
                 TimeUnit.MILLISECONDS.toHours(offlineWindowMillis),
                 TimeUnit.MILLISECONDS.toHours(playtimeWindowMillis),
                 updateIntervalSeconds);
@@ -90,7 +88,6 @@ public class GhostTabPlugin {
 
     @Subscribe
     public void onProxyShutdown(ProxyShutdownEvent event) {
-        // Checkpoint current online sessions before saving
         checkpointOnlineSessions();
         saveData();
         savePlaytime();
@@ -109,8 +106,8 @@ public class GhostTabPlugin {
         data.onlineSince = Instant.now();
         data.lastSeen = Instant.now();
         data.online = true;
+        captureSkin(data, player);
 
-        // Force an immediate update so the joining player sees the current list
         server.getScheduler().buildTask(this, this::updateAllTabLists).delay(500, TimeUnit.MILLISECONDS).schedule();
     }
 
@@ -122,6 +119,7 @@ public class GhostTabPlugin {
         PlayerData data = playerData.get(uuid);
         if (data != null) {
             Instant now = Instant.now();
+            captureSkin(data, player);
             if (data.online && data.onlineSince != null) {
                 recordSession(data.onlineSince, now);
             }
@@ -130,7 +128,6 @@ public class GhostTabPlugin {
             data.onlineSince = null;
         }
 
-        // Clean up very old entries occasionally
         cleanOldEntries();
         cleanOldSessions();
     }
@@ -153,10 +150,12 @@ public class GhostTabPlugin {
             }
         }
 
-        // Both lists sorted alphabetically (case-insensitive)
-        Comparator<PlayerData> alpha = Comparator.comparing(d -> d.name.toLowerCase(Locale.ROOT));
-        online.sort(alpha);
-        offline.sort(alpha);
+        // Online: longest online at the top (earliest onlineSince first)
+        online.sort(Comparator.comparing(
+                (PlayerData d) -> d.onlineSince != null ? d.onlineSince : Instant.MAX));
+        // Offline: longest offline at the bottom (most recent lastSeen first)
+        offline.sort(Comparator.comparing(
+                (PlayerData d) -> d.lastSeen != null ? d.lastSeen : Instant.MIN).reversed());
 
         int onlineCount = online.size();
         int ghostCount = offline.size();
@@ -187,21 +186,15 @@ public class GhostTabPlugin {
                                   Component header, Component footer, Instant now) {
         TabList tabList = viewer.getTabList();
 
-        // UUIDs of players currently online on the proxy.
-        // NEVER remove or recreate these — Velocity/backend own them.
-        // Clearing + re-adding with modified profiles causes malformed packets
-        // and kicks (especially with ViaVersion).
         Set<UUID> onlineUuids = server.getAllPlayers().stream()
                 .map(Player::getUniqueId)
                 .collect(Collectors.toSet());
 
-        // Desired ghost UUIDs this tick
         Set<UUID> desiredGhosts = offline.stream()
                 .map(d -> d.uuid)
                 .filter(uuid -> uuid != null && !onlineUuids.contains(uuid))
                 .collect(Collectors.toSet());
 
-        // Remove only stale ghost entries (not online players)
         for (TabListEntry existing : new ArrayList<>(tabList.getEntries())) {
             UUID id = existing.getProfile().getId();
             if (!onlineUuids.contains(id) && !desiredGhosts.contains(id)) {
@@ -209,7 +202,6 @@ public class GhostTabPlugin {
             }
         }
 
-        // --- Online players: only update display name / listOrder in place ---
         int onlineOrder = 10000 + online.size();
         for (PlayerData data : online) {
             onlineOrder--;
@@ -217,7 +209,6 @@ public class GhostTabPlugin {
 
             Optional<TabListEntry> existingOpt = tabList.getEntry(data.uuid);
             if (existingOpt.isEmpty()) {
-                // Not present yet (very early join) — leave it to Velocity
                 continue;
             }
 
@@ -232,11 +223,9 @@ public class GhostTabPlugin {
             try {
                 existing.setListOrder(onlineOrder);
             } catch (Throwable ignored) {
-                // listOrder only on 1.21.2+
             }
         }
 
-        // --- Ghost / offline players: add or update ---
         int ghostOrder = 1000 + offline.size();
         for (PlayerData data : offline) {
             ghostOrder--;
@@ -248,8 +237,16 @@ public class GhostTabPlugin {
                     .replace("{time}", timeStr);
             Component displayComponent = parse(display);
 
+            List<GameProfile.Property> props = data.properties != null
+                    ? data.properties
+                    : List.of();
+
             Optional<TabListEntry> existingOpt = tabList.getEntry(data.uuid);
-            if (existingOpt.isPresent()) {
+            boolean needsRebuild = existingOpt.isPresent()
+                    && !props.isEmpty()
+                    && existingOpt.get().getProfile().getProperties().isEmpty();
+
+            if (existingOpt.isPresent() && !needsRebuild) {
                 TabListEntry existing = existingOpt.get();
                 existing.setDisplayName(displayComponent);
                 try {
@@ -257,8 +254,10 @@ public class GhostTabPlugin {
                 } catch (Throwable ignored) {
                 }
             } else {
-                // Real name, empty properties (default skin). No name prefix hacks.
-                GameProfile profile = new GameProfile(data.uuid, data.name, List.of());
+                if (needsRebuild) {
+                    tabList.removeEntry(data.uuid);
+                }
+                GameProfile profile = new GameProfile(data.uuid, data.name, props);
 
                 TabListEntry.Builder builder = TabListEntry.builder()
                         .tabList(tabList)
@@ -283,7 +282,6 @@ public class GhostTabPlugin {
         try {
             return miniMessage.deserialize(input);
         } catch (Exception e) {
-            // Fallback to legacy if MiniMessage fails
             return LegacyComponentSerializer.legacyAmpersand().deserialize(input);
         }
     }
@@ -382,7 +380,6 @@ public class GhostTabPlugin {
                         long lastSeenEpoch = ((Number) lastSeenObj).longValue();
                         Instant lastSeen = Instant.ofEpochSecond(lastSeenEpoch);
 
-                        // Skip anyone already outside the offline window
                         if (lastSeen.isBefore(cutoff)) {
                             skipped++;
                             continue;
@@ -392,6 +389,7 @@ public class GhostTabPlugin {
                         data.uuid = uuid;
                         data.lastSeen = lastSeen;
                         data.online = false;
+                        data.properties = loadProperties(map.get("properties"));
                         playerData.put(uuid, data);
                         loaded++;
                     } catch (Exception e) {
@@ -419,15 +417,18 @@ public class GhostTabPlugin {
             for (Map.Entry<UUID, PlayerData> entry : playerData.entrySet()) {
                 PlayerData data = entry.getValue();
 
-                // Players who are still online at shutdown must be treated as
-                // having just gone offline *now*, otherwise their lastSeen stays
-                // at login time and they appear offline for hours after reboot.
                 Instant effectiveLastSeen = data.online ? now : data.lastSeen;
 
                 if (data.online || effectiveLastSeen.isAfter(cutoff)) {
+                    if (data.online) {
+                        server.getPlayer(data.uuid).ifPresent(p -> captureSkin(data, p));
+                    }
                     Map<String, Object> map = new LinkedHashMap<>();
                     map.put("name", data.name);
                     map.put("lastSeen", effectiveLastSeen.getEpochSecond());
+                    if (data.properties != null && !data.properties.isEmpty()) {
+                        map.put("properties", serializeProperties(data.properties));
+                    }
                     toSave.put(entry.getKey().toString(), map);
                 }
             }
@@ -437,7 +438,6 @@ public class GhostTabPlugin {
             Files.writeString(dataFile, yaml.dump(toSave));
             logger.info("Saved {} player records to disk", toSave.size());
 
-            // Also checkpoint playtime on periodic saves
             checkpointOnlineSessions();
             savePlaytime();
         } catch (IOException e) {
@@ -445,7 +445,6 @@ public class GhostTabPlugin {
         }
     }
 
-    /** Record a completed play session [start, end). */
     private void recordSession(Instant start, Instant end) {
         if (start == null || end == null || !end.isAfter(start)) {
             return;
@@ -459,13 +458,12 @@ public class GhostTabPlugin {
         cleanOldSessions();
     }
 
-    /** Flush currently-online sessions into the session list and restart their counters. */
     private void checkpointOnlineSessions() {
         Instant now = Instant.now();
         for (PlayerData data : playerData.values()) {
             if (data.online && data.onlineSince != null) {
                 recordSession(data.onlineSince, now);
-                data.onlineSince = now; // avoid double-counting
+                data.onlineSince = now;
             }
         }
     }
@@ -477,10 +475,6 @@ public class GhostTabPlugin {
         }
     }
 
-    /**
-     * Total seconds of playtime that fall inside [now - playtimeWindow, now].
-     * Includes completed sessions (clipped to the window) and current online sessions.
-     */
     private long computePlaytimeSeconds(Instant now) {
         long nowSec = now.getEpochSecond();
         long windowStart = nowSec - (playtimeWindowMillis / 1000);
@@ -497,7 +491,6 @@ public class GhostTabPlugin {
             }
         }
 
-        // Add live online sessions (not yet recorded)
         for (PlayerData data : playerData.values()) {
             if (data.online && data.onlineSince != null) {
                 long start = Math.max(data.onlineSince.getEpochSecond(), windowStart);
@@ -514,7 +507,6 @@ public class GhostTabPlugin {
         if (hours < 0.05) {
             return "0";
         }
-        // One decimal place, strip trailing .0
         String s = String.format(Locale.US, "%.1f", hours);
         if (s.endsWith(".0")) {
             s = s.substring(0, s.length() - 2);
@@ -577,12 +569,58 @@ public class GhostTabPlugin {
         }
     }
 
+    private void captureSkin(PlayerData data, Player player) {
+        try {
+            List<GameProfile.Property> props = player.getGameProfile().getProperties();
+            if (props != null && !props.isEmpty()) {
+                data.properties = new ArrayList<>(props);
+            }
+        } catch (Exception e) {
+            logger.debug("Could not capture skin for {}", data.name, e);
+        }
+    }
+
+    private List<Map<String, String>> serializeProperties(List<GameProfile.Property> props) {
+        List<Map<String, String>> out = new ArrayList<>();
+        for (GameProfile.Property p : props) {
+            Map<String, String> m = new LinkedHashMap<>();
+            m.put("name", p.getName());
+            m.put("value", p.getValue());
+            if (p.getSignature() != null) {
+                m.put("signature", p.getSignature());
+            }
+            out.add(m);
+        }
+        return out;
+    }
+
+    private List<GameProfile.Property> loadProperties(Object raw) {
+        if (!(raw instanceof List<?> list) || list.isEmpty()) {
+            return null;
+        }
+        List<GameProfile.Property> props = new ArrayList<>();
+        for (Object item : list) {
+            if (!(item instanceof Map<?, ?> map)) continue;
+            Object name = map.get("name");
+            Object value = map.get("value");
+            if (name == null || value == null) continue;
+            Object sig = map.get("signature");
+            if (sig != null) {
+                props.add(new GameProfile.Property(String.valueOf(name), String.valueOf(value), String.valueOf(sig)));
+            } else {
+                props.add(new GameProfile.Property(String.valueOf(name), String.valueOf(value)));
+            }
+        }
+        return props.isEmpty() ? null : props;
+    }
+
     private static class PlayerData {
         UUID uuid;
         String name;
         Instant onlineSince;
         Instant lastSeen;
         boolean online;
+        List<GameProfile.Property> properties;
 
         PlayerData(UUID uuid, String name) {
             this.uuid = uuid;
@@ -591,7 +629,6 @@ public class GhostTabPlugin {
             this.online = false;
         }
 
-        // For loading from disk
         PlayerData(String name) {
             this.name = name;
             this.lastSeen = Instant.now();
