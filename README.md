@@ -10,9 +10,10 @@ Offline players remain visible for a configurable window (default **24 hours**).
 ## Features
 
 - Live updating times (default every 30 seconds)
-- Configurable header / footer with placeholders `{online}` and `{ghosts}`
+- Configurable header / footer with placeholders `{online}`, `{ghosts}`, `{total_hours}`, `{playtime_window}`
+- Footer can show total hours played by all players in a rolling window (default 12 hours)
 - Configurable display formats using MiniMessage
-- Persists recent player data across proxy restarts
+- Persists recent player data and playtime sessions across proxy restarts
 - Online players at the top (A–Z), offline/ghost players at the bottom (A–Z)
 - No dependency on backend plugins or VelocityTab
 
@@ -46,8 +47,9 @@ See `config.yml` for all options:
 ```yaml
 offline-window-hours: 24
 update-interval-seconds: 30
+playtime-window-hours: 12
 header: "<gold><bold>A Zombie Pigman Broke My Door</bold></gold>"
-footer: "<gray>Online: {online} | Ghosts: {ghosts}</gray>"
+footer: "<gray>Players have played a total of <white>{total_hours}</white> hours in the last {playtime_window} hours</gray>"
 online-format: "<white>{name} <gray>{time}</gray>"
 offline-format: "<dark_gray>{name} <gray>offline {time}</gray>"
 ```

@@ -6,11 +6,16 @@ offline-window-hours: 24
 # How often (in seconds) the tab list times should refresh
 update-interval-seconds: 30
 
+# Rolling window (in hours) used for the total playtime shown in the footer
+playtime-window-hours: 12
+
 # Tab list header (supports MiniMessage / Adventure formatting)
+# Placeholders: {online} {ghosts} {total_hours} {playtime_window}
 header: "<gold><bold>A Zombie Pigman Broke My Door</bold></gold>"
 
 # Tab list footer
-footer: "<gray>Online: {online} | Ghosts: {ghosts}</gray>"
+# Placeholders: {online} {ghosts} {total_hours} {playtime_window}
+footer: "<gray>Players have played a total of <white>{total_hours}</white> hours in the last {playtime_window} hours</gray>"
 
 # Display format for online players: {name} and {time}
 online-format: "<white>{name} <gray>{time}</gray>"
