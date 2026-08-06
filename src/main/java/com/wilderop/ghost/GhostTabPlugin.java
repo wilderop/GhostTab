@@ -655,11 +655,9 @@ public class GhostTabPlugin {
             Object value = map.get("value");
             if (name == null || value == null) continue;
             Object sig = map.get("signature");
-            if (sig != null) {
-                props.add(new GameProfile.Property(String.valueOf(name), String.valueOf(value), String.valueOf(sig)));
-            } else {
-                props.add(new GameProfile.Property(String.valueOf(name), String.valueOf(value)));
-            }
+            // Velocity Property always requires name, value, signature
+            String signature = sig != null ? String.valueOf(sig) : "";
+            props.add(new GameProfile.Property(String.valueOf(name), String.valueOf(value), signature));
         }
         return props.isEmpty() ? null : props;
     }
