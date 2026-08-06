@@ -16,6 +16,7 @@ import com.velocitypowered.api.util.GameProfile;
 import net.kyori.adventure.text.Component;
 import net.kyori.adventure.text.minimessage.MiniMessage;
 import net.kyori.adventure.text.serializer.legacy.LegacyComponentSerializer;
+import net.kyori.adventure.text.serializer.plain.PlainTextComponentSerializer;
 import org.slf4j.Logger;
 import org.yaml.snakeyaml.Yaml;
 
@@ -33,7 +34,7 @@ import java.util.stream.Collectors;
 @Plugin(
         id = "ghosttab",
         name = "GhostTab",
-        version = "1.5",
+        version = "1.6",
         description = "Shows online players with session time and recently offline players in the tab list",
         authors = {"wilderop"}
 )
@@ -44,11 +45,9 @@ public class GhostTabPlugin {
     private final Path dataDirectory;
 
     private final Map<UUID, PlayerData> playerData = new ConcurrentHashMap<>();
-    // Completed play sessions within the playtime window: [startEpochSeconds, endEpochSeconds]
     private final List<long[]> recentSessions = Collections.synchronizedList(new ArrayList<>());
     private final MiniMessage miniMessage = MiniMessage.miniMessage();
 
-    // Config values
     private long offlineWindowMillis = TimeUnit.HOURS.toMillis(24);
     private long playtimeWindowMillis = TimeUnit.HOURS.toMillis(12);
     private long updateIntervalSeconds = 30;
@@ -80,7 +79,7 @@ public class GhostTabPlugin {
                 .repeat(5, TimeUnit.MINUTES)
                 .schedule();
 
-        logger.info("GhostTab v1.5 enabled. Offline window: {}h, playtime window: {}h, update every {}s",
+        logger.info("GhostTab v1.6 enabled. Offline window: {}h, playtime window: {}h, update every {}s",
                 TimeUnit.MILLISECONDS.toHours(offlineWindowMillis),
                 TimeUnit.MILLISECONDS.toHours(playtimeWindowMillis),
                 updateIntervalSeconds);
@@ -106,9 +105,16 @@ public class GhostTabPlugin {
         data.onlineSince = Instant.now();
         data.lastSeen = Instant.now();
         data.online = true;
+        data.nickDisplay = null;
+        data.ghostTabApplied = false;
         captureSkin(data, player);
 
-        server.getScheduler().buildTask(this, this::updateAllTabLists).delay(500, TimeUnit.MILLISECONDS).schedule();
+        for (long delayMs : new long[]{300L, 1000L, 2500L}) {
+            server.getScheduler().buildTask(this, () -> {
+                captureNickFromTab(player, data);
+                updateAllTabLists();
+            }).delay(delayMs, TimeUnit.MILLISECONDS).schedule();
+        }
     }
 
     @Subscribe
@@ -150,10 +156,8 @@ public class GhostTabPlugin {
             }
         }
 
-        // Online: longest online at the top (earliest onlineSince first)
         online.sort(Comparator.comparing(
                 (PlayerData d) -> d.onlineSince != null ? d.onlineSince : Instant.MAX));
-        // Offline: longest offline at the bottom (most recent lastSeen first)
         offline.sort(Comparator.comparing(
                 (PlayerData d) -> d.lastSeen != null ? d.lastSeen : Instant.MIN).reversed());
 
@@ -213,13 +217,26 @@ public class GhostTabPlugin {
             }
 
             TabListEntry existing = existingOpt.get();
+
+            if (!data.ghostTabApplied) {
+                captureNickFromEntry(data, existing);
+            }
+
             Instant since = data.onlineSince != null ? data.onlineSince : now;
             String timeStr = formatDuration(Duration.between(since, now));
-            String display = onlineFormat
-                    .replace("{name}", data.name)
-                    .replace("{time}", timeStr);
 
-            existing.setDisplayName(parse(display));
+            Component displayComponent;
+            if (data.nickDisplay != null) {
+                displayComponent = data.nickDisplay.append(parse("<gray> " + timeStr + "</gray>"));
+            } else {
+                String display = onlineFormat
+                        .replace("{name}", data.name)
+                        .replace("{time}", timeStr);
+                displayComponent = parse(display);
+            }
+
+            existing.setDisplayName(displayComponent);
+            data.ghostTabApplied = true;
             try {
                 existing.setListOrder(onlineOrder);
             } catch (Throwable ignored) {
@@ -232,10 +249,15 @@ public class GhostTabPlugin {
             if (data.uuid == null || onlineUuids.contains(data.uuid)) continue;
 
             String timeStr = formatDuration(Duration.between(data.lastSeen, now));
-            String display = offlineFormat
-                    .replace("{name}", data.name)
-                    .replace("{time}", timeStr);
-            Component displayComponent = parse(display);
+            Component displayComponent;
+            if (data.nickDisplay != null) {
+                displayComponent = data.nickDisplay.append(parse("<gray> offline " + timeStr + "</gray>"));
+            } else {
+                String display = offlineFormat
+                        .replace("{name}", data.name)
+                        .replace("{time}", timeStr);
+                displayComponent = parse(display);
+            }
 
             List<GameProfile.Property> props = data.properties != null
                     ? data.properties
@@ -580,6 +602,34 @@ public class GhostTabPlugin {
         }
     }
 
+    private void captureNickFromTab(Player player, PlayerData data) {
+        try {
+            player.getTabList().getEntry(player.getUniqueId()).ifPresent(entry ->
+                    captureNickFromEntry(data, entry));
+        } catch (Exception e) {
+            logger.debug("Could not capture nick for {}", data.name, e);
+        }
+    }
+
+    private void captureNickFromEntry(PlayerData data, TabListEntry entry) {
+        entry.getDisplayNameComponent().ifPresent(dn -> {
+            String plain = PlainTextComponentSerializer.plainText().serialize(dn).trim();
+            if (plain.isEmpty()) {
+                return;
+            }
+            if (plain.equalsIgnoreCase(data.name)) {
+                return;
+            }
+            String escaped = java.util.regex.Pattern.quote(data.name);
+            if (plain.matches("(?i)" + escaped + "\\s+\\d+h\\s+\\d+m")
+                    || plain.matches("(?i)" + escaped + "\\s+\\d+m")
+                    || plain.matches("(?i)" + escaped + "\\s+\\d+s")) {
+                return;
+            }
+            data.nickDisplay = dn;
+        });
+    }
+
     private List<Map<String, String>> serializeProperties(List<GameProfile.Property> props) {
         List<Map<String, String>> out = new ArrayList<>();
         for (GameProfile.Property p : props) {
@@ -621,6 +671,8 @@ public class GhostTabPlugin {
         Instant lastSeen;
         boolean online;
         List<GameProfile.Property> properties;
+        Component nickDisplay;
+        boolean ghostTabApplied;
 
         PlayerData(UUID uuid, String name) {
             this.uuid = uuid;
