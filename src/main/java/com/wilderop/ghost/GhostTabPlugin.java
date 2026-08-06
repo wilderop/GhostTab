@@ -34,7 +34,7 @@ import java.util.stream.Collectors;
 @Plugin(
         id = "ghosttab",
         name = "GhostTab",
-        version = "1.6",
+        version = "1.7",
         description = "Shows online players with session time and recently offline players in the tab list",
         authors = {"wilderop"}
 )
@@ -79,7 +79,7 @@ public class GhostTabPlugin {
                 .repeat(5, TimeUnit.MINUTES)
                 .schedule();
 
-        logger.info("GhostTab v1.6 enabled. Offline window: {}h, playtime window: {}h, update every {}s",
+        logger.info("GhostTab v1.7 enabled. Offline window: {}h, playtime window: {}h, update every {}s",
                 TimeUnit.MILLISECONDS.toHours(offlineWindowMillis),
                 TimeUnit.MILLISECONDS.toHours(playtimeWindowMillis),
                 updateIntervalSeconds);
@@ -226,7 +226,7 @@ public class GhostTabPlugin {
             String timeStr = formatDuration(Duration.between(since, now));
 
             Component displayComponent;
-            if (data.nickDisplay != null) {
+            if (data.nickDisplay != null && !looksLikeGhostTabFormat(data.nickDisplay, data.name)) {
                 displayComponent = data.nickDisplay.append(parse("<gray> " + timeStr + "</gray>"));
             } else {
                 String display = onlineFormat
@@ -243,61 +243,53 @@ public class GhostTabPlugin {
             }
         }
 
+        // Always remove + re-add ghosts so listOrder applies reliably
+        for (PlayerData data : offline) {
+            if (data.uuid == null || onlineUuids.contains(data.uuid)) continue;
+            if (tabList.containsEntry(data.uuid)) {
+                tabList.removeEntry(data.uuid);
+            }
+        }
+
         int ghostOrder = 1000 + offline.size();
         for (PlayerData data : offline) {
             ghostOrder--;
             if (data.uuid == null || onlineUuids.contains(data.uuid)) continue;
 
             String timeStr = formatDuration(Duration.between(data.lastSeen, now));
-            Component displayComponent;
-            if (data.nickDisplay != null) {
-                displayComponent = data.nickDisplay.append(parse("<gray> offline " + timeStr + "</gray>"));
-            } else {
-                String display = offlineFormat
-                        .replace("{name}", data.name)
-                        .replace("{time}", timeStr);
-                displayComponent = parse(display);
-            }
+            Component displayComponent = buildOfflineDisplay(data, timeStr);
 
             List<GameProfile.Property> props = data.properties != null
                     ? data.properties
                     : List.of();
+            GameProfile profile = new GameProfile(data.uuid, data.name, props);
 
-            Optional<TabListEntry> existingOpt = tabList.getEntry(data.uuid);
-            boolean needsRebuild = existingOpt.isPresent()
-                    && !props.isEmpty()
-                    && existingOpt.get().getProfile().getProperties().isEmpty();
+            TabListEntry.Builder builder = TabListEntry.builder()
+                    .tabList(tabList)
+                    .profile(profile)
+                    .displayName(displayComponent)
+                    .latency(0)
+                    .gameMode(0);
 
-            if (existingOpt.isPresent() && !needsRebuild) {
-                TabListEntry existing = existingOpt.get();
-                existing.setDisplayName(displayComponent);
-                try {
-                    existing.setListOrder(ghostOrder);
-                } catch (Throwable ignored) {
-                }
-            } else {
-                if (needsRebuild) {
-                    tabList.removeEntry(data.uuid);
-                }
-                GameProfile profile = new GameProfile(data.uuid, data.name, props);
-
-                TabListEntry.Builder builder = TabListEntry.builder()
-                        .tabList(tabList)
-                        .profile(profile)
-                        .displayName(displayComponent)
-                        .latency(0)
-                        .gameMode(0);
-
-                try {
-                    builder.listOrder(ghostOrder);
-                } catch (Throwable ignored) {
-                }
-
-                tabList.addEntry(builder.build());
+            try {
+                builder.listOrder(ghostOrder);
+            } catch (Throwable ignored) {
             }
+
+            tabList.addEntry(builder.build());
         }
 
         viewer.sendPlayerListHeaderAndFooter(header, footer);
+    }
+
+    private Component buildOfflineDisplay(PlayerData data, String timeStr) {
+        if (data.nickDisplay != null && !looksLikeGhostTabFormat(data.nickDisplay, data.name)) {
+            return data.nickDisplay.append(parse("<gray> offline " + timeStr + "</gray>"));
+        }
+        String display = offlineFormat
+                .replace("{name}", data.name)
+                .replace("{time}", timeStr);
+        return parse(display);
     }
 
     private Component parse(String input) {
@@ -613,21 +605,32 @@ public class GhostTabPlugin {
 
     private void captureNickFromEntry(PlayerData data, TabListEntry entry) {
         entry.getDisplayNameComponent().ifPresent(dn -> {
+            if (looksLikeGhostTabFormat(dn, data.name)) {
+                return;
+            }
             String plain = PlainTextComponentSerializer.plainText().serialize(dn).trim();
-            if (plain.isEmpty()) {
-                return;
-            }
-            if (plain.equalsIgnoreCase(data.name)) {
-                return;
-            }
-            String escaped = java.util.regex.Pattern.quote(data.name);
-            if (plain.matches("(?i)" + escaped + "\\s+\\d+h\\s+\\d+m")
-                    || plain.matches("(?i)" + escaped + "\\s+\\d+m")
-                    || plain.matches("(?i)" + escaped + "\\s+\\d+s")) {
+            if (plain.isEmpty() || plain.equalsIgnoreCase(data.name)) {
                 return;
             }
             data.nickDisplay = dn;
         });
+    }
+
+    private boolean looksLikeGhostTabFormat(Component dn, String username) {
+        String plain = PlainTextComponentSerializer.plainText().serialize(dn).trim();
+        if (plain.isEmpty()) {
+            return false;
+        }
+        if (plain.toLowerCase(Locale.ROOT).contains(" offline ")) {
+            return true;
+        }
+        if (plain.matches(".*\\s+\\d+h\\s+\\d+m$")
+                || plain.matches(".*\\s+\\d+m$")
+                || plain.matches(".*\\s+\\d+s$")) {
+            return true;
+        }
+        String escaped = java.util.regex.Pattern.quote(username);
+        return plain.matches("(?i)" + escaped + "\\s+\\d+.*");
     }
 
     private List<Map<String, String>> serializeProperties(List<GameProfile.Property> props) {
@@ -655,7 +658,6 @@ public class GhostTabPlugin {
             Object value = map.get("value");
             if (name == null || value == null) continue;
             Object sig = map.get("signature");
-            // Velocity Property always requires name, value, signature
             String signature = sig != null ? String.valueOf(sig) : "";
             props.add(new GameProfile.Property(String.valueOf(name), String.valueOf(value), signature));
         }
