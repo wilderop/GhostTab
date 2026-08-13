@@ -34,7 +34,7 @@ import java.util.stream.Collectors;
 @Plugin(
         id = "ghosttab",
         name = "GhostTab",
-        version = "1.7",
+        version = "1.8",
         description = "Shows online players with session time and recently offline players in the tab list",
         authors = {"wilderop"}
 )
@@ -79,7 +79,7 @@ public class GhostTabPlugin {
                 .repeat(5, TimeUnit.MINUTES)
                 .schedule();
 
-        logger.info("GhostTab v1.7 enabled. Offline window: {}h, playtime window: {}h, update every {}s",
+        logger.info("GhostTab v1.8 enabled. Offline window: {}h, playtime window: {}h, update every {}s",
                 TimeUnit.MILLISECONDS.toHours(offlineWindowMillis),
                 TimeUnit.MILLISECONDS.toHours(playtimeWindowMillis),
                 updateIntervalSeconds);
@@ -102,8 +102,10 @@ public class GhostTabPlugin {
         PlayerData data = playerData.computeIfAbsent(uuid, k -> new PlayerData(uuid, name));
         data.name = name;
         data.uuid = uuid;
-        data.onlineSince = Instant.now();
-        data.lastSeen = Instant.now();
+        Instant joined = Instant.now();
+        data.onlineSince = joined;
+        data.playtimeSegmentStart = joined;
+        data.lastSeen = joined;
         data.online = true;
         data.nickDisplay = null;
         data.ghostTabApplied = false;
@@ -126,12 +128,16 @@ public class GhostTabPlugin {
         if (data != null) {
             Instant now = Instant.now();
             captureSkin(data, player);
-            if (data.online && data.onlineSince != null) {
-                recordSession(data.onlineSince, now);
+            Instant segStart = data.playtimeSegmentStart != null
+                    ? data.playtimeSegmentStart
+                    : data.onlineSince;
+            if (data.online && segStart != null) {
+                recordSession(segStart, now);
             }
             data.online = false;
             data.lastSeen = now;
             data.onlineSince = null;
+            data.playtimeSegmentStart = null;
         }
 
         cleanOldEntries();
@@ -243,7 +249,6 @@ public class GhostTabPlugin {
             }
         }
 
-        // Always remove + re-add ghosts so listOrder applies reliably
         for (PlayerData data : offline) {
             if (data.uuid == null || onlineUuids.contains(data.uuid)) continue;
             if (tabList.containsEntry(data.uuid)) {
@@ -472,12 +477,21 @@ public class GhostTabPlugin {
         cleanOldSessions();
     }
 
+    /**
+     * Flush currently-online playtime segments into the session list.
+     * Does NOT reset onlineSince — that is the true session start used for tab display.
+     */
     private void checkpointOnlineSessions() {
         Instant now = Instant.now();
         for (PlayerData data : playerData.values()) {
-            if (data.online && data.onlineSince != null) {
-                recordSession(data.onlineSince, now);
-                data.onlineSince = now;
+            if (data.online) {
+                Instant segStart = data.playtimeSegmentStart != null
+                        ? data.playtimeSegmentStart
+                        : data.onlineSince;
+                if (segStart != null) {
+                    recordSession(segStart, now);
+                    data.playtimeSegmentStart = now;
+                }
             }
         }
     }
@@ -506,10 +520,15 @@ public class GhostTabPlugin {
         }
 
         for (PlayerData data : playerData.values()) {
-            if (data.online && data.onlineSince != null) {
-                long start = Math.max(data.onlineSince.getEpochSecond(), windowStart);
-                if (nowSec > start) {
-                    total += (nowSec - start);
+            if (data.online) {
+                Instant liveStart = data.playtimeSegmentStart != null
+                        ? data.playtimeSegmentStart
+                        : data.onlineSince;
+                if (liveStart != null) {
+                    long start = Math.max(liveStart.getEpochSecond(), windowStart);
+                    if (nowSec > start) {
+                        total += (nowSec - start);
+                    }
                 }
             }
         }
@@ -667,7 +686,10 @@ public class GhostTabPlugin {
     private static class PlayerData {
         UUID uuid;
         String name;
+        /** True session start for tab display. Never reset while online. */
         Instant onlineSince;
+        /** Rolling start for playtime checkpoints only. */
+        Instant playtimeSegmentStart;
         Instant lastSeen;
         boolean online;
         List<GameProfile.Property> properties;
